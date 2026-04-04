@@ -21,9 +21,14 @@ This build includes:
 - Use the “Save now” button in the Site Settings panel to manually trigger a save message when needed.
 
 ## Order email
-- Orders always notify `junayedvai08@gmail.com` by default (you can change the email in the admin settings panel).
-- Resend uses the baked-in API key `re_gzjiSz1D_87RvAkaS3xo6tKtdCmBZxPJs`, so no environment variables are required.
-- If you add `RESEND_API_KEY` or `ORDER_FROM_EMAIL` environment variables later, they will override the defaults automatically.
+- Orders notify the server-side default admin email unless you set `ORDER_NOTIFY_EMAIL` in Vercel.
+- The order route now ignores client-supplied settings, checks request origin, rate limits repeated submissions, and escapes order fields before sending email.
+- Set `RESEND_API_KEY` and `ORDER_FROM_EMAIL` in Vercel for production email delivery.
+
+## Admin Security
+- The `/cosmic-vault-portal` dashboard now requires a password session.
+- Set `ADMIN_PANEL_PASSWORD` and `ADMIN_SESSION_SECRET` in Vercel before going live.
+- Admin access uses an httpOnly signed cookie instead of a hidden URL.
 
 
 ## Public Access

